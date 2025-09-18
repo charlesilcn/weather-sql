@@ -1,152 +1,230 @@
+import logging
 import os
 import time
-import random
+from typing import Optional
 import pandas as pd
+import calendar
+from datetime import datetime, date, timedelta
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import requests
 from io import StringIO
-from config.config import SCRAPER_CONFIG, NASA_API_CONFIG
-from src.utils.common import logger, create_retry_session, clean_nasa_data
-from config.cities import CITIES  #城市数据地址
+from src.db.mysql_ops import get_db_connection, load_csv_to_db
+from src.utils.common import clean_nasa_data, get_output_dir
+from config.cities import CITIES
+from config.config import SCRAPER_CONFIG
 
-def fetch_city_segment(city_id, name, lat, lng, start_date, end_date):
-    """抓取单个城市的一段日期数据（支持断点续抓）"""
-    # 断点续抓：检查本地是否已存在该段数据
-    seg_filename = f"city_{city_id}_{start_date}_{end_date}.csv"
-    seg_path = os.path.join(SCRAPER_CONFIG['output_dir'], seg_filename)
-    if os.path.exists(seg_path):
-        logger.info(f"城市 {name}（{city_id}）{start_date}-{end_date} 已存在，跳过抓取")
-        with open(seg_path, 'r', encoding='utf-8') as f:
-            return f.read()
+logger = logging.getLogger('nasa_weather_scraper')
+
+
+def get_last_date_for_city(city_id: int) -> Optional[date]:
+    """获取数据库中某城市的最新数据日期"""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT MAX(date) FROM weather_daily 
+                    WHERE city_id = %s
+                """, (city_id,))
+                result = cursor.fetchone()
+                return result[0] if result[0] else None
+    except Exception as e:
+        logger.error(f"查询城市 {city_id} 最新数据日期失败: {e}", exc_info=True)
+        return None
+
+
+def calculate_date_ranges(start_date: date, end_date: date) -> list[tuple[date, date]]:
+    """计算按季度划分的日期范围列表"""
+    ranges = []
+    current = start_date
+    while current <= end_date:
+        quarter_end_month = ((current.month - 1) // 3 + 1) * 3
+        quarter_end_day = calendar.monthrange(current.year, quarter_end_month)[1]
+        quarter_end = date(current.year, quarter_end_month, quarter_end_day)
+        segment_end = min(quarter_end, end_date)
+        ranges.append((current, segment_end))
+        current = segment_end + timedelta(days=1)
+    return ranges
+
+
+def fetch_segment_data(city_id: int, name: str, lat: float, lon: float, 
+                      start_date: date, end_date: date) -> Optional[str]:
+    """抓取指定时间段的数据（修复422错误相关问题）"""
+    # 经纬度范围与格式校验
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        logger.error(f"城市 {name}（{city_id}）经纬度无效: lat={lat}, lon={lon}")
+        return None
     
-    # 发送请求（带重试）
-    session = create_retry_session(SCRAPER_CONFIG['retry'])
-    for try_num in range(3):  # 额外重试3次（配合session的重试机制）
-        try:
-            response = session.get(
-                url=NASA_API_CONFIG['url'],
-                params={
-                    'start': start_date,
-                    'end': end_date,
-                    'latitude': lat,
-                    'longitude': lng,
-                    'community': NASA_API_CONFIG['community'],
-                    'parameters': NASA_API_CONFIG['parameters'],
-                    'format': NASA_API_CONFIG['format']
-                },
-                timeout=SCRAPER_CONFIG['timeout']
-            )
-            response.raise_for_status()  # 触发HTTP错误（如404/500）
-            # 保存数据到本地（断点续抓用）
-            with open(seg_path, 'w', encoding='utf-8') as f:
-                f.write(response.text)
-            logger.debug(f"城市 {name}（{city_id}）{start_date}-{end_date} 抓取成功")
-            return response.text
-        except Exception as e:
-            logger.warning(
-                f"城市 {name}（{city_id}）{start_date}-{end_date} 第{try_num+1}次失败: {e}"
-            )
-            time.sleep(2 ** try_num + random.random())  # 指数退避
-    logger.error(f"城市 {name}（{city_id}）{start_date}-{end_date} 抓取失败")
+    # 限制经纬度精度（API通常只接受4-6位小数）
+    lat = round(float(lat), 4)
+    lon = round(float(lon), 4)
+
+    # 格式化日期为YYYYMMDD
+    start_str = start_date.strftime("%Y%m%d")
+    end_str = end_date.strftime("%Y%m%d")
+
+    # 创建带重试机制的Session
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=SCRAPER_CONFIG['max_retries'],
+        backoff_factor=SCRAPER_CONFIG['backoff_factor'],
+        status_forcelist=[429, 500, 502, 503, 504, 422]  # 增加422重试
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+
+    try:
+        # 修正API参数：移除冗余参数，使用正确格式
+        params = {
+            'parameters': 'T2M_MAX,T2M_MIN,T2M',  # 移除YEAR, MO, DY（API自动返回）
+            'community': 're',  # 改为小写
+            'longitude': lon,
+            'latitude': lat,
+            'start': start_str,
+            'end': end_str,
+            'format': 'csv',  # 改为小写
+            'header': 'true'   # 显式要求表头
+        }
+
+        if not SCRAPER_CONFIG.get('api_url'):
+            logger.error("API URL未配置")
+            return None
+
+        response = session.get(
+            SCRAPER_CONFIG['api_url'],
+            params=params,
+            timeout=SCRAPER_CONFIG['timeout']
+        )
+        response.raise_for_status()
+
+        if not response.text.strip():
+            logger.warning(f"城市 {name}（{city_id}）{start_str}-{end_str} 无数据返回")
+            return None
+
+        logger.debug(f"API返回原始数据:\n{response.text[:500]}")
+        return response.text
+
+    except requests.exceptions.HTTPError as e:
+        # 针对422错误增加详细调试信息
+        response_text = response.text[:500] if 'response' in locals() else '无响应内容'
+        logger.error(
+            f"城市 {name}（{city_id}）HTTP错误: {e}\n"
+            f"请求参数: {params}\n"
+            f"响应内容: {response_text}"
+        )
+        
+        # 422错误时尝试缩短时间范围为单月
+        if 'response' in locals() and response.status_code == 422:
+            logger.warning("尝试单月数据抓取重试...")
+            month_end = date(start_date.year, start_date.month, 
+                           calendar.monthrange(start_date.year, start_date.month)[1])
+            if month_end < end_date:
+                return fetch_segment_data(city_id, name, lat, lon, start_date, month_end)
+    except requests.exceptions.Timeout:
+        logger.error(f"城市 {name}（{city_id}）请求超时")
+    except Exception as e:
+        logger.error(f"城市 {name}（{city_id}）{start_str}-{end_str} 抓取失败: {e}", exc_info=True)
+    finally:
+        session.close()
     return None
 
-def fetch_city_year(city_id, name, lat, lng, year):
-    """抓取单个城市一整年的数据（按季度分段）"""
-    segments = [
-        (f"{year}0101", f"{year}0331"),  # Q1
-        (f"{year}0401", f"{year}0630"),  # Q2
-        (f"{year}0701", f"{year}0930"),  # Q3
-        (f"{year}1001", f"{year}1231")   # Q4
-    ]
-    all_data = []
-    for start, end in segments:
-        seg_data = fetch_city_segment(city_id, name, lat, lng, start, end)
-        if not seg_data:
-            continue
-        # 解析CSV数据
-        #lines = seg_data.split('\n')
-        # 跳过注释行（动态查找数据起始行）
-        #data_lines = [line for line in lines if line.strip() and not line.startswith('#')]
-        #if not data_lines:
-        #    logger.warning(f"城市 {name}（{city_id}）{start}-{end} 无有效数据")
-        #    continue
-        # 转换为DataFrame
-        #try:
-        #    df = pd.read_csv(StringIO('\n'.join(data_lines)))
-        #    all_data.append(df)
-        #except Exception as e:
-        #    logger.error(f"城市 {name}（{city_id}）{start}-{end} 解析失败: {e}")
-        lines = seg_data.split('\n')
-        header_line_idx = None  # 表头行的索引
-        data_start_idx = None   # 数据行的起始索引
 
-        # 1. 遍历所有行，找到表头行（包含关键字 YEAR 和 T2M_MAX）
-        for idx, line in enumerate(lines):
-            line_stripped = line.strip()
-            # 跳过空行和注释行
-            if not line_stripped or line_stripped.startswith('#'):
-                continue
-            # 表头行必须包含 YEAR、MO、T2M_MAX（NASA CSV 固定表头）
-            if 'YEAR' in line_stripped and 'MO' in line_stripped and 'T2M_MAX' in line_stripped:
-                header_line_idx = idx
-                data_start_idx = idx + 1  # 数据行从表头下一行开始
-                break
-
-        # 2. 检查是否找到有效表头
-        if header_line_idx is None:
-            logger.warning(f"城市 {name}（{city_id}）{start}-{end} 未找到有效表头，跳过")
-            continue
-
-        # 3. 提取表头 + 数据行（确保列数匹配）
-        header_line = lines[header_line_idx].strip()
-        data_lines = [line.strip() for line in lines[data_start_idx:] if line.strip()]  # 过滤数据行中的空行
-
-        # 4. 合并表头和数据行，生成完整的CSV字符串
-        csv_str = header_line + '\n' + '\n'.join(data_lines)
-        if len(data_lines) == 0:
-            logger.warning(f"城市 {name}（{city_id}）{start}-{end} 无数据行，跳过")
-            continue
-
-        # 5. 解析CSV（此时列数必然匹配）
-        try:
-            df = pd.read_csv(StringIO(csv_str))
-            # 额外校验：确保必要列存在（防止API返回格式变更）
-            required_cols = ['YEAR', 'MO', 'DY', 'T2M_MAX', 'T2M_MIN', 'T2M']
-            missing_cols = [col for col in required_cols if col not in df.columns]
-            if missing_cols:
-                logger.warning(f"城市 {name}（{city_id}）{start}-{end} 缺少必要列: {missing_cols}，跳过")
-                continue
-            all_data.append(df)
-            logger.debug(f"城市 {name}（{city_id}）{start}-{end} 解析成功，共 {len(df)} 条数据")
-        except Exception as e:
-            logger.error(f"城市 {name}（{city_id}）{start}-{end} 解析失败: {e}", exc_info=True)
-    if not all_data:
-        return pd.DataFrame()
-    # 合并全年数据并清洗
-    year_df = pd.concat(all_data, ignore_index=True)
-    return clean_nasa_data(year_df, city_id)
-
-def fetch_all_cities():
-    """抓取所有城市的多年数据"""
-    all_df = []
-    for year in SCRAPER_CONFIG['years']:
-        logger.info(f"开始抓取 {year} 年数据")
-        for city_id, (name, lat, lng) in CITIES.items():
+def process_city_data(city_id: int, name: str, lat: float, lon: float, 
+                     end_date: date) -> Optional[pd.DataFrame]:
+    """处理单个城市的数据抓取与清洗"""
+    last_date = get_last_date_for_city(city_id)
+    
+    if last_date is None:
+        start_date = date(SCRAPER_CONFIG['start_year'], 1, 1)
+        logger.info(f"城市 {name}（{city_id}）无历史数据，从 {start_date} 开始全量抓取")
+    else:
+        start_date = last_date + timedelta(days=1)
+        if start_date > end_date:
+            logger.info(f"城市 {name}（{city_id}）数据已是最新，无需抓取")
+            return None
+        logger.info(f"城市 {name}（{city_id}）从 {start_date} 增量抓取至 {end_date}")
+    
+    date_ranges = calculate_date_ranges(start_date, end_date)
+    city_data = []
+    
+    for seg_start, seg_end in date_ranges:
+        logger.debug(f"城市 {name}（{city_id}）抓取 {seg_start} 至 {seg_end} 数据")
+        seg_data = fetch_segment_data(city_id, name, lat, lon, seg_start, seg_end)
+        
+        if seg_data:
             try:
-                city_df = fetch_city_year(city_id, name, lat, lng, year)
-                if not city_df.empty:
-                    all_df.append(city_df)
-                    logger.info(f"城市 {name}（{city_id}）{year} 年数据处理完成，共 {len(city_df)} 条")
+                df = clean_nasa_data(seg_data, city_id)
+                if not df.empty:
+                    city_data.append(df)
+                    logger.debug(f"城市 {name} 抓取成功，{seg_start}至{seg_end}共{len(df)}条")
             except Exception as e:
-                logger.error(f"城市 {name}（{city_id}）{year} 年处理失败: {e}")
-                continue
-    if not all_df:
-        logger.warning("未抓取到任何有效数据")
+                logger.error(f"城市 {name} 数据清洗失败: {e}", exc_info=True)
+        
+        time.sleep(SCRAPER_CONFIG.get('request_interval', 2))  # 延长间隔避免限流
+    
+    if city_data:
+        return pd.concat(city_data, ignore_index=True)
+    return None
+
+
+def fetch_incremental_data() -> Optional[str]:
+    """增量抓取数据：修复日期范围问题"""
+    logger.info("===== 开始执行增量数据抓取流程 =====")
+    
+    output_dir = get_output_dir()
+    os.makedirs(output_dir, exist_ok=True)
+    
+    all_data = []
+    today = date.today()
+    end_date = today - timedelta(days=1)  # 关键修复：只抓取到昨天的数据
+    if end_date < date(SCRAPER_CONFIG['start_year'], 1, 1):
+        logger.warning("没有可抓取的有效日期范围")
         return None
-    # 合并所有数据并去重
-    final_df = pd.concat(all_df, ignore_index=True)
-    final_df = final_df.drop_duplicates(subset=['city_id', 'date'], keep='last')
-    logger.info(f"所有数据抓取完成，共 {len(final_df)} 条（去重后）")
-    # 保存到总数据文件
-    final_path = os.path.join(os.path.dirname(SCRAPER_CONFIG['output_dir']), 'all_history_final.csv')
-    final_df.to_csv(final_path, index=False, date_format='%Y-%m-%d')
-    logger.info(f"总数据已保存至 {final_path}")
-    return final_path
+    
+    for city_id, (name, lat, lon) in CITIES.items():
+        try:
+            city_df = process_city_data(city_id, name, lat, lon, end_date)  # 传入修正后的end_date
+            if city_df is not None:
+                all_data.append(city_df)
+                logger.info(f"城市 {name}（{city_id}）处理完成，共 {len(city_df)} 条")
+        except Exception as e:
+            logger.error(f"城市 {name}（{city_id}）处理失败: {e}", exc_info=True)
+            continue
+    
+    if all_data:
+        final_df = pd.concat(all_data, ignore_index=True)
+        final_df = final_df.drop_duplicates(subset=['city_id', 'date'])
+        logger.info(f"所有增量数据抓取完成，共 {len(final_df)} 条（去重后）")
+        
+        csv_path = os.path.join(output_dir, f"incremental_history_{today}.csv")
+        final_df.to_csv(csv_path, index=False)
+        logger.info(f"增量数据已保存至 {csv_path}")
+        return csv_path
+    else:
+        logger.info("没有新的增量数据需要抓取")
+        return None
+
+
+def main():
+    """主函数：配置日志并执行抓取流程"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('logs/incremental_scraper.log'),
+            logging.StreamHandler()
+        ]
+    )
+    
+    csv_path = fetch_incremental_data()
+    
+    if csv_path and os.path.exists(csv_path):
+        try:
+            load_csv_to_db(csv_path)
+            logger.info("===== 增量数据导入完成 =====")
+        except Exception as e:
+            logger.error(f"增量数据导入失败: {e}", exc_info=True)
+
+
+if __name__ == "__main__":
+    main()
