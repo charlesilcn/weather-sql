@@ -10,7 +10,7 @@ from urllib3.util.retry import Retry
 import requests
 from io import StringIO
 from src.db.mysql_ops import get_db_connection, load_csv_to_db
-from src.utils.common import clean_nasa_data, get_output_dir
+from src.utils.common import clean_nasa_data, get_output_dir, generate_visualizations  # 新增可视化函数
 from config.cities import CITIES
 from config.config import SCRAPER_CONFIG
 
@@ -49,13 +49,13 @@ def calculate_date_ranges(start_date: date, end_date: date) -> list[tuple[date, 
 
 def fetch_segment_data(city_id: int, name: str, lat: float, lon: float, 
                       start_date: date, end_date: date) -> Optional[str]:
-    """抓取指定时间段的数据（修复422错误相关问题）"""
+    """抓取指定时间段的数据（扩展气象指标）"""
     # 经纬度范围与格式校验
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         logger.error(f"城市 {name}（{city_id}）经纬度无效: lat={lat}, lon={lon}")
         return None
     
-    # 限制经纬度精度（API通常只接受4-6位小数）
+    # 限制经纬度精度
     lat = round(float(lat), 4)
     lon = round(float(lon), 4)
 
@@ -68,22 +68,21 @@ def fetch_segment_data(city_id: int, name: str, lat: float, lon: float,
     retry_strategy = Retry(
         total=SCRAPER_CONFIG['max_retries'],
         backoff_factor=SCRAPER_CONFIG['backoff_factor'],
-        status_forcelist=[429, 500, 502, 503, 504, 422]  # 增加422重试
+        status_forcelist=[429, 500, 502, 503, 504, 422]
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("https://", adapter)
 
     try:
-        # 修正API参数：移除冗余参数，使用正确格式
+        # 扩展请求参数，增加更多气象指标
         params = {
-            'parameters': 'T2M_MAX,T2M_MIN,T2M',  # 移除YEAR, MO, DY（API自动返回）
-            'community': 're',  # 改为小写
+            'parameters': 'T2M_MAX,T2M_MIN,T2M,RH2M,WS2M,PRECTOT',  # 新增多个指标
+            'community': 'RE',
             'longitude': lon,
             'latitude': lat,
             'start': start_str,
             'end': end_str,
-            'format': 'csv',  # 改为小写
-            'header': 'true'   # 显式要求表头
+            'format': 'CSV',
         }
 
         if not SCRAPER_CONFIG.get('api_url'):
@@ -105,7 +104,6 @@ def fetch_segment_data(city_id: int, name: str, lat: float, lon: float,
         return response.text
 
     except requests.exceptions.HTTPError as e:
-        # 针对422错误增加详细调试信息
         response_text = response.text[:500] if 'response' in locals() else '无响应内容'
         logger.error(
             f"城市 {name}（{city_id}）HTTP错误: {e}\n"
@@ -113,7 +111,6 @@ def fetch_segment_data(city_id: int, name: str, lat: float, lon: float,
             f"响应内容: {response_text}"
         )
         
-        # 422错误时尝试缩短时间范围为单月
         if 'response' in locals() and response.status_code == 422:
             logger.warning("尝试单月数据抓取重试...")
             month_end = date(start_date.year, start_date.month, 
@@ -160,15 +157,18 @@ def process_city_data(city_id: int, name: str, lat: float, lon: float,
             except Exception as e:
                 logger.error(f"城市 {name} 数据清洗失败: {e}", exc_info=True)
         
-        time.sleep(SCRAPER_CONFIG.get('request_interval', 2))  # 延长间隔避免限流
+        time.sleep(SCRAPER_CONFIG.get('request_interval', 2))
     
     if city_data:
-        return pd.concat(city_data, ignore_index=True)
+        # 生成该城市的可视化图表
+        combined_df = pd.concat(city_data, ignore_index=True)
+        generate_visualizations(combined_df, name, city_id)
+        return combined_df
     return None
 
 
 def fetch_incremental_data() -> Optional[str]:
-    """增量抓取数据：修复日期范围问题"""
+    """增量抓取数据"""
     logger.info("===== 开始执行增量数据抓取流程 =====")
     
     output_dir = get_output_dir()
@@ -176,14 +176,14 @@ def fetch_incremental_data() -> Optional[str]:
     
     all_data = []
     today = date.today()
-    end_date = today - timedelta(days=1)  # 关键修复：只抓取到昨天的数据
+    end_date = today - timedelta(days=1)
     if end_date < date(SCRAPER_CONFIG['start_year'], 1, 1):
         logger.warning("没有可抓取的有效日期范围")
         return None
     
     for city_id, (name, lat, lon) in CITIES.items():
         try:
-            city_df = process_city_data(city_id, name, lat, lon, end_date)  # 传入修正后的end_date
+            city_df = process_city_data(city_id, name, lat, lon, end_date)
             if city_df is not None:
                 all_data.append(city_df)
                 logger.info(f"城市 {name}（{city_id}）处理完成，共 {len(city_df)} 条")

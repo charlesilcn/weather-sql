@@ -1,164 +1,196 @@
 import re
+import warnings
+import matplotlib.pyplot as plt
+import seaborn as sns
 from io import StringIO
 from datetime import datetime
-import pandas as pd  # 导入pandas库
+import pandas as pd
 import logging
 import os
 from config.config import SCRAPER_CONFIG
 
+warnings.filterwarnings("ignore", category=UserWarning, message="Glyph .* missing from font.*")
+
+# 强制使用Arial字体（适配英文标签）
+plt.rcParams["font.family"] = ["Arial"]
+plt.rcParams["axes.unicode_minus"] = False  # 解决负号显示异常
+sns.set(font_scale=1.2)  # 调整图表字体大小
+sns.set_style("whitegrid")  # 图表网格样式
+
+# 初始化日志（确保后续函数可调用）
 logger = logging.getLogger('nasa_weather_scraper')
 
+# -------------------------- 2. 目录工具函数（功能不变） --------------------------
 def get_output_dir() -> str:
-    """获取数据输出目录，若不存在则创建"""
+    """Get data output directory, create if not exists"""
     output_dir = SCRAPER_CONFIG['output_dir']
     if not os.path.exists(output_dir):
-        os.makedirs(output_dir)  # 确保目录存在
+        os.makedirs(output_dir)
     return output_dir
 
+def get_visualization_dir() -> str:
+    """Get visualization output directory, create if not exists"""
+    viz_dir = os.path.join(get_output_dir(), 'visualizations')
+    if not os.path.exists(viz_dir):
+        os.makedirs(viz_dir)
+    return viz_dir
+
+# -------------------------- 3. NASA数据清洗核心函数（功能不变，日志英文适配） --------------------------
 def clean_nasa_data(csv_str: str, city_id: int) -> pd.DataFrame:
     """
-    清洗NASA数据（增强版），处理列名变化
-    
-    Args:
-        csv_str: CSV格式的字符串数据
-        city_id: 城市ID
-        
-    Returns:
-        清洗后的DataFrame，若清洗失败则返回空DataFrame
+    Clean NASA CSV data: extract valid rows, unify column names, filter invalid values
+    Returns: Cleaned DataFrame (empty if cleaning fails)
     """
-    # 首先查看原始数据前20行，帮助诊断格式问题
     lines = csv_str.splitlines()
     if len(lines) > 20:
-        logger.debug(f"城市ID {city_id} 的CSV前20行数据: \n" + "\n".join(lines[:20]))
-    
-    # 尝试解析日期范围行
-    date_range_line = None
-    for line in lines[:5]:
-        if 'through' in line and ('month' in line or 'date' in line.lower()):
-            date_range_line = line
-            break
-    
-    if not date_range_line:
-        logger.error(f"城市ID {city_id} 未找到日期范围信息")
-        return pd.DataFrame()
-    
-    # 提取日期范围（使用正则表达式）
-    try:
-        date_pattern = r'\b\d{2}/\d{2}/\d{4}\b'
-        dates = re.findall(date_pattern, date_range_line)
-        
-        if len(dates) != 2:
-            raise ValueError(f"未找到两个日期，找到: {dates}")
-            
-        start_date_str, end_date_str = dates
-        start_date = datetime.strptime(start_date_str, "%m/%d/%Y")
-        end_date = datetime.strptime(end_date_str, "%m/%d/%Y")
-    except Exception as e:
-        logger.error(f"城市ID {city_id} 解析日期范围失败: {e}，原始行: {date_range_line}")
-        return pd.DataFrame()
-    
-    # 尝试找到数据开始的行（更灵活的匹配）
-    data_start_row = None
+        logger.debug(f"City ID {city_id} raw data (first 20 lines):\n" + "\n".join(lines[:20]))
+
+    # Locate data start row (skip comment lines)
+    data_start_row = 5  # Default: skip first 5 comment lines (NASA common format)
     for i, line in enumerate(lines):
-        # 更灵活的关键词匹配
         lower_line = line.lower()
-        if ('t2m' in lower_line or 'temp' in lower_line) and \
-           ('year' in lower_line or 'mo' in lower_line or 'dy' in lower_line or 'day' in lower_line):
+        if ('year' in lower_line or 'mo' in lower_line or 'dy' in lower_line) and ('t2m' in lower_line):
             data_start_row = i
             break
-    
-    if data_start_row is None:
-        # 尝试默认跳过前5行（应急方案）
-        data_start_row = 5
-        logger.warning(f"城市ID {city_id} 未找到数据起始行，尝试跳过前5行")
-    
-    # 解析实际数据行
+
+    # Parse CSV with pandas
     try:
         df = pd.read_csv(
             StringIO(csv_str),
             skiprows=data_start_row,
             sep=',',
             on_bad_lines='skip',
-            engine='python'  # 使用python引擎提高兼容性
+            engine='python'
         )
     except Exception as e:
-        logger.error(f"城市ID {city_id} 解析数据失败: {e}")
+        logger.error(f"City ID {city_id} CSV parsing failed: {e}")
         return pd.DataFrame()
-    
-    # 打印所有列名（关键调试信息）
-    logger.debug(f"城市ID {city_id} 数据列名: {df.columns.tolist()}")
-    
-    # 定义可能的列名映射（考虑更多可能性）
-    temp_mappings = {
-        't2m_max': ['t2m_max', 't2mmax', 'max_temp', 'maximum_temperature'],
-        't2m_min': ['t2m_min', 't2mmin', 'min_temp', 'minimum_temperature'],
-        't2m': ['t2m', 'temp', 'temperature', 'avg_temp', 'average_temperature']
+
+    # Unify column names (match NASA standard parameter names)
+    column_mapping = {
+        # Date-related columns (required for date merging)
+        'year': 'year', 'yr': 'year', 'y': 'year',
+        'mo': 'month', 'month': 'month', 'm': 'month',
+        'dy': 'day', 'day': 'day', 'd': 'day',
+        # Weather metrics (match NASA API standard names)
+        't2m_max': 't2m_max', 't2mmax': 't2m_max',
+        't2m_min': 't2m_min', 't2mmin': 't2m_min',
+        't2m': 't2m', 'temperature': 't2m',
+        'rh2m': 'rh2m', 'relative_humidity': 'rh2m',
+        'ws2m': 'ws2m', 'wind_speed': 'ws2m',
+        'prectot': 'precip', 'precipitation': 'precip'
     }
-    
-    date_mappings = {
-        'year': ['year', 'yr', 'y'],
-        'month': ['mo', 'month', 'm'],
-        'day': ['dy', 'day', 'd']
-    }
-    
-    # 自动匹配列名
-    column_mapping = {}
-    lower_columns = [col.lower() for col in df.columns]
-    
-    # 匹配温度列
-    for target, candidates in temp_mappings.items():
-        for candidate in candidates:
-            if candidate in lower_columns:
-                idx = lower_columns.index(candidate)
-                column_mapping[df.columns[idx]] = target
+    # Only keep valid columns (avoid renaming errors)
+    valid_mapping = {}
+    for raw_col in df.columns:
+        lower_raw = raw_col.lower()
+        for key, target in column_mapping.items():
+            if key == lower_raw:
+                valid_mapping[raw_col] = target
                 break
-    
-    # 匹配日期列
-    for target, candidates in date_mappings.items():
-        for candidate in candidates:
-            if candidate in lower_columns:
-                idx = lower_columns.index(candidate)
-                column_mapping[df.columns[idx]] = target
-                break
-    
-    # 检查是否匹配到足够的列
-    missing_temp = [t for t in temp_mappings if t not in column_mapping.values()]
-    missing_date = [d for d in date_mappings if d not in column_mapping.values()]
-    
-    if missing_temp:
-        logger.warning(f"城市ID {city_id} 缺少温度列: {missing_temp}")
+    df = df.rename(columns=valid_mapping)
+
+    # Check required date columns (data is invalid without these)
+    required_date_cols = ['year', 'month', 'day']
+    missing_date = [col for col in required_date_cols if col not in df.columns]
     if missing_date:
-        logger.error(f"城市ID {city_id} 缺少日期列: {missing_date}")
+        logger.error(f"City ID {city_id} missing date columns: {missing_date}")
         return pd.DataFrame()
-    
-    # 重命名列
-    try:
-        df = df.rename(columns=column_mapping)
-    except Exception as e:
-        logger.error(f"城市ID {city_id} 列名重命名失败: {e}")
-        return pd.DataFrame()
-    
-    # 添加城市ID
+
+    # Add city ID + clean invalid data
     df['city_id'] = city_id
-    
-    # 转换日期
     try:
-        df['date'] = pd.to_datetime(
-            df[['year', 'month', 'day']],
-            errors='coerce'
-        )
+        # Merge year/month/day into 'date' column
+        df['date'] = pd.to_datetime(df[['year', 'month', 'day']], errors='coerce')
+        # Filter: empty date, NASA missing values (-999/-9999)
         df = df.dropna(subset=['date'])
+        for col in ['t2m_max', 't2m_min', 't2m', 'rh2m', 'ws2m', 'precip']:
+            if col in df.columns:
+                df = df[~df[col].isin([-999, -9999, 'NaN', 'NA'])]
     except Exception as e:
-        logger.error(f"城市ID {city_id} 日期转换失败: {e}")
+        logger.error(f"City ID {city_id} data filtering failed: {e}")
         return pd.DataFrame()
-    
-    # 过滤缺测值（考虑多种可能的缺测标记）
-    for col in ['t2m_max', 't2m_min', 't2m']:
-        if col in df.columns:
-            # 常见的缺测标记
-            missing_values = [-999, -9999, 'NaN', 'NA', '']
-            df = df[~df[col].isin(missing_values)]
-    
-    # 选择需要的列
-    final_columns = ['city_id', 'date'] + [col for col in ['t2m_max', 't2m_min', 't2m'] if col in df.columns]
-    return df[final_columns]
+
+    # Keep only necessary columns
+    final_cols = ['city_id', 'date'] + [col for col in ['t2m_max', 't2m_min', 't2m', 'rh2m', 'ws2m', 'precip'] if col in df.columns]
+    return df[final_cols]
+
+# -------------------------- 4. 可视化生成函数（全英文标签，适配Arial） --------------------------
+def generate_visualizations(df: pd.DataFrame, city_name: str, city_id: int):
+    """
+    Generate 3 types of charts for single city (all English labels for Arial font):
+    1. Temperature Trend (Max/Min/Avg)
+    2. Wind Speed vs Relative Humidity
+    3. Monthly Precipitation Distribution
+    Charts are saved to 'visualizations' directory automatically
+    """
+    if df.empty:
+        logger.warning(f"City {city_name} ({city_id}) has no valid data, skip visualization")
+        return
+
+    viz_dir = get_visualization_dir()
+    today = datetime.now().strftime("%Y%m%d")  # Add date to filename (avoid overwriting)
+    plt.close('all')  # Close old plots to save memory
+
+    # 1. Temperature Trend Chart
+    if all(col in df.columns for col in ['t2m_max', 't2m_min', 't2m']):
+        plt.figure(figsize=(12, 6))
+        # Plot with English labels and distinct colors
+        sns.lineplot(data=df, x='date', y='t2m_max', label='Max Temperature (°C)', color='#ff6b6b')
+        sns.lineplot(data=df, x='date', y='t2m_min', label='Min Temperature (°C)', color='#4ecdc4')
+        sns.lineplot(data=df, x='date', y='t2m', label='Average Temperature (°C)', color='#45b7d1')
+        # English title and labels
+        plt.title(f'{city_name} Temperature Trend', fontsize=14)
+        plt.xlabel('Date')
+        plt.ylabel('Temperature (°C)')
+        plt.xticks(rotation=45)  # Rotate date labels for readability
+        plt.legend(loc='best')
+        plt.tight_layout()  # Auto-adjust layout to avoid label cutoff
+        # Save plot
+        temp_path = os.path.join(viz_dir, f'{city_id}_{city_name}_temperature_{today}.png')
+        plt.savefig(temp_path, dpi=100)  # dpi=100 for clear image
+        logger.info(f"Temperature trend chart saved to: {temp_path}")
+
+    # 2. Wind Speed vs Relative Humidity Scatter Chart
+    if all(col in df.columns for col in ['ws2m', 'rh2m']):
+        df['month'] = df['date'].dt.month  # Color by month
+        plt.figure(figsize=(10, 5))
+        sns.scatterplot(
+            data=df, 
+            x='ws2m', 
+            y='rh2m', 
+            hue='month', 
+            palette='viridis',  # Colorful palette for month distinction
+            alpha=0.7  # Transparency to avoid overlap
+        )
+        # English title and labels
+        plt.title(f'{city_name} Avg Wind Speed vs Relative Humidity', fontsize=14)
+        plt.xlabel('Average Wind Speed (m/s)')
+        plt.ylabel('Average Relative Humidity (%)')
+        plt.legend(title='Month', bbox_to_anchor=(1.05, 1), loc='upper left')  # Move legend to avoid overlap
+        plt.tight_layout()
+        # Save plot
+        ws_rh_path = os.path.join(viz_dir, f'{city_id}_{city_name}_wind_humidity_{today}.png')
+        plt.savefig(ws_rh_path, dpi=100)
+        logger.info(f"Wind-Humidity chart saved to: {ws_rh_path}")
+
+    # 3. Monthly Precipitation Distribution Chart
+    if 'precip' in df.columns:
+        df['month'] = df['date'].dt.month
+        plt.figure(figsize=(10, 5))
+        sns.boxplot(
+            data=df, 
+            x='month', 
+            y='precip', 
+            palette='Set2'  # Soft palette for boxplot
+        )
+        # English title and labels (month as number, no Chinese)
+        plt.title(f'{city_name} Monthly Precipitation Distribution', fontsize=14)
+        plt.xlabel('Month')
+        plt.ylabel('Precipitation (mm)')
+        plt.xticks(range(0, 12), [f'{i+1}' for i in range(12)])  # Show month as 1-12
+        plt.tight_layout()
+        # Save plot
+        precip_path = os.path.join(viz_dir, f'{city_id}_{city_name}_precipitation_{today}.png')
+        plt.savefig(precip_path, dpi=100)
+        logger.info(f"Monthly precipitation chart saved to: {precip_path}")
