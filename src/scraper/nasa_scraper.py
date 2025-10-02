@@ -160,12 +160,22 @@ def process_city_data(city_id: int, name: str, lat: float, lon: float,
         time.sleep(SCRAPER_CONFIG.get('request_interval', 2))
     
     if city_data:
-        # 生成该城市的可视化图表
         combined_df = pd.concat(city_data, ignore_index=True)
+        # 1. 生成基础可视化（原功能）
         generate_visualizations(combined_df, name, city_id)
+        
+        # 2. 新增：深度分析数据
+        logger.info(f"开始分析城市 {name}（{city_id}）的天气数据...")
+        monthly_stats, stats_dict = analyze_weather_data(combined_df, name, city_id)
+        
+        # 3. 新增：生成高级可视化图表
+        generate_advanced_visualizations(combined_df, monthly_stats, stats_dict)
+        
+        # 4. 新增：保存分析报告到CSV
+        save_analysis_report(monthly_stats, stats_dict)
+        
         return combined_df
     return None
-
 
 def fetch_incremental_data() -> Optional[str]:
     """增量抓取数据"""
